@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: pbcon
+Version: 1.0.0.dev0
+Summary: Convenience tools to work with pybricks.
+Home-page: 
+Author: Tom Schank
+Author-email: DrTom@schank.ch
+Keywords: pybricks lego robotics micropython

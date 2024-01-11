@@ -1,0 +1,3 @@
+[console_scripts]
+pbcon = pbcon.pbcon:main
+pbscan = pbcon.pbscan:main
