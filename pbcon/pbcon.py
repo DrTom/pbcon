@@ -1,73 +1,479 @@
 #!/usr/bin/env python
 
 from __future__ import annotations
-import datetime
-import json
-import sys
 
+import argparse
 import asyncio
+import datetime
+import humanize
+import io
 import logging
 import os
-import pybricksdev.compile
+import urwid
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from pybricksdev.ble import find_device
 from pybricksdev.ble.pybricks import HubCapabilityFlag
 from pybricksdev.cli import _get_script_path
 from pybricksdev.compile import compile_multi_file
 from pybricksdev.connections import ConnectionState
 from pybricksdev.connections.pybricks import PybricksHub
+import time
 
 
-event_loop = asyncio.get_event_loop()
+class ConnectionStates:
+    DISCONNECTED = "DISCONNECTED"
+    SEARCHING = "SEARCHING"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    DISCONNECTING = "DISCONNECTING"
+
+
+connection_state_queue: asyncio.Queue = asyncio.Queue()
+connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
+
 hub: Hub = None
-is_running = False
+
 logger: logging.Logger = None
+
+compile_update_queue: asyncio.Queue = asyncio.Queue()
+compile_timestamp: int = 0
+
+upload_queue: asyncio.Queue = asyncio.Queue()
+upload_timestamp: int = 0
+upload_state_queue: asyncio.Queue = asyncio.Queue()
+
 mpy: bytes = None
-opts = None
+opts: argparse.Namespace = None
+ui: UI = None
 
 
-def init_logger():
+def init_app_logger():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
-        '%(asctime)s %(levelname)s - %(message)s')
-    console_handler = logging.StreamHandler()
-    if opts.debug:
-        console_handler.setLevel(logging.DEBUG)
-    else:
-        console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+        fmt='%(asctime)s.%(msecs)03d %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S')
+    file_handler = logging.handlers.RotatingFileHandler(
+        "logs/pbcon.log", maxBytes=1024**5, backupCount=5)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
     return logger
 
 
 class Hub(PybricksHub):
 
-    def __init__(self):
-        super().__init__()
+    def __init__hub_logger(self):
         self.print_output = False
         self._enable_line_handler = True
+        self.hub_stdout_logger = logging.getLogger("hub_stdout")
+        self.hub_stdout_logger.setLevel(logging.DEBUG)
+        self.hub_stdout_logger_formatter = logging.Formatter(
+            fmt='%(asctime)s %(message)s', datefmt='W%W-%w-%a_%H:%M:%S')
+        file_handler = logging.handlers.RotatingFileHandler(
+            "logs/hub.log", maxBytes=1024**2, backupCount=5)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(self.hub_stdout_logger_formatter)
+        self.hub_stdout_logger.addHandler(file_handler)
 
-    async def upload(
-        self,
-        line_handler: bool = True,
-    ) -> None:
+        async def log_dispatch_loop():
+            while True:
+                log = await self._stdout_line_queue.get()
+                self.hub_stdout_logger.info(log)
+        asyncio.get_event_loop().create_task(log_dispatch_loop())
+
+    def __init__(self):
+        super().__init__()
+        self.hub_log_receivers: List[asyncio.Queue] = []
+        self.__init__hub_logger()
+
+    async def log_dispatch_loop(self):
+        while True:
+            log = await self._stdout_line_queue.get()
+            logger.info(f"HUB-LOG: {log}")
+            for receiver in self.hub_log_receivers:
+                receiver.put_nowait(log)
+
+    async def upload(self, program: bytes = None) -> None:
         """
-        Compiles and uploads a user program. See PybricksHub.run() for details. 
+        This is mosly identical to the original download_user_program method from PybricksHub
+
+        It does not use the tqdm progress bar queue to report the progress of the ui.
         """
-        if self.connection_state_observable.value != ConnectionState.CONNECTED:
-            raise RuntimeError("not connected")
-        # Reset output buffer
-        self.log_file = None
-        self.output = []
-        self._stdout_buf.clear()
-        await self.download_user_program(mpy)
+
+        from pybricksdev.ble.pybricks import PYBRICKS_COMMAND_EVENT_UUID
+        import struct
+        from pybricksdev.ble.pybricks import Command
+        from pybricksdev.tools import chunk
+
+        program = program or mpy
+
+        try:
+            logger.info(f"Uploading")
+            timestamp = time.time()
+
+            upload_state_queue.put_nowait(["start", None])
+
+            # the hub tells us the max size of program that is allowed, so we can fail early
+            if len(program) > self._max_user_program_size:
+                raise ValueError(
+                    f"program is too big ({len(program)} bytes). Hub has limit of {self._max_user_program_size} bytes."
+                )
+
+            # clear user program meta so hub doesn't try to run invalid program
+
+            await self.client.write_gatt_char(
+                PYBRICKS_COMMAND_EVENT_UUID,
+                struct.pack("<BI", Command.WRITE_USER_PROGRAM_META, 0),
+                response=True,
+            )
+
+            # payload is max size minus header size
+            payload_size = self._max_write_size - 5
+
+            upload_state_queue.put_nowait(["progress", 0])
+
+            for i, c in enumerate(chunk(program, payload_size)):
+                await self.client.write_gatt_char(
+                    PYBRICKS_COMMAND_EVENT_UUID,
+                    struct.pack(
+                        f"<BI{len(c)}s",
+                        Command.COMMAND_WRITE_USER_RAM,
+                        i * payload_size,
+                        c,
+                    ),
+                    response=True,
+                )
+
+                upload_state_queue.put_nowait(
+                    ["progress", (i * payload_size + len(c)) / len(program)])
+
+            # set the metadata to notify that writing was successful
+            await self.client.write_gatt_char(
+                PYBRICKS_COMMAND_EVENT_UUID,
+                struct.pack("<BI", Command.WRITE_USER_PROGRAM_META,
+                            len(program)),
+                response=True,
+            )
+
+            upload_state_queue.put_nowait(["success", None])
+
+            global upload_timestamp
+            upload_timestamp = timestamp
+            logger.info(f"Uploaded")
+
+        except Exception as e:
+            logger.error(f"Upload Error: {e}")
+            upload_state_queue.put_nowait(["error", e])
+
+
+class UI:
+
+    class HubLog:
+        queue: asyncio.Queue = asyncio.Queue()
+        listbox: urwid.ListBox = urwid.ListBox(urwid.SimpleListWalker([]))
+        hub: Hub = None
+
+    def __init_hub_log(self, hub: Hub):
+
+        UI.HubLog.hub = hub
+
+        UI.HubLog.listbox.body.append(urwid.Text("Hub Log:"))
+
+        queue_handler = logging.handlers.QueueHandler(UI.HubLog.queue)
+        queue_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(
+            fmt='%(asctime)s %(message)s',
+            datefmt='%H:%M:%S')
+        hub.hub_stdout_logger.addHandler(queue_handler)
+
+        async def hub_log_loop(self):
+            listbox = UI.HubLog.listbox
+            while True:
+                log_record = await UI.HubLog.queue.get()
+                listbox.body.append(
+                    urwid.Text(formatter.format(log_record)))
+                if len(listbox.body) > 100:
+                    listbox.body.pop(0)
+                if listbox.get_focus()[1] == len(listbox.body) - 2:
+                    listbox.set_focus(
+                        len(listbox.body) - 1)
+                self.urwid_loop.draw_screen()
+
+        asyncio.get_event_loop().create_task(hub_log_loop(self))
+
+    def __init__(self, hub: Hub):
+        self.palette = [
+            ("body", "black", "light gray", "standout"),
+            ("reverse", "light gray", "black"),
+            ("header", "white", "dark blue", "bold"),
+            ("success", "light gray", "dark green", "standout"),
+            ("warn", "light gray", "dark red", ("bold", "standout")),
+            ("important", "dark blue", "light gray", ("standout", "underline")),
+            ("editfc", "white", "dark blue", "bold"),
+            ("editbx", "light gray", "dark blue"),
+            ("editcp", "black", "light gray", "standout"),
+            ("bright", "dark gray", "light gray", ("bold", "standout")),
+            ("buttn", "black", "dark cyan"),
+            ("buttnf", "white", "dark blue", "bold"),
+        ]
+
+        def handle_keys(key):
+            if key in ('q', 'Q'):
+                raise urwid.ExitMainLoop()
+            elif key in ('h', 'H'):
+                self.main_frame.body = self.help
+                self.urwid_loop.draw_screen()
+            elif key in ('l', 'L'):
+                self.main_frame.body = UI.HubLog.listbox
+                self.urwid_loop.draw_screen()
+            elif key in ('r', 'R'):
+                self.asyncio_event_loop.create_task(run())
+            elif key in ('u', 'U'):
+                upload_queue.put_nowait(time.time())
+            else:
+                return key
+
+        self.__init_hub_log(hub)
+
+        self.help = urwid.ListBox(urwid.SimpleListWalker([
+            urwid.Text("pbcon - Pybricks Controller"),
+            urwid.Text(""),
+            urwid.Text("h: show this help"),
+            urwid.Text(""),
+            urwid.Text("q: quit"),
+            urwid.Text(""),
+            urwid.Text("l: show pbcon application log"),
+            urwid.Text(""),
+            urwid.Text("u: upload program"),
+            urwid.Text(""),
+            urwid.Text("r: run program"),
+        ]))
+
+        self.connection_state = urwid.AttrMap(urwid.Text(""), 'warn')
+
+        self.upload_state = urwid.AttrMap(urwid.Text("",), 'warn')
+
+        self.main_frame = urwid.Frame(
+            header=urwid.Columns([self.connection_state, self.upload_state]),
+            body=self.help)
+
+        self.asyncio_event_loop = asyncio.get_event_loop()
+        evl = urwid.AsyncioEventLoop(loop=self.asyncio_event_loop)
+        self.urwid_loop = urwid.MainLoop(
+            widget=self.main_frame,
+            palette=self.palette,
+            event_loop=evl,
+            unhandled_input=handle_keys)
+        # self.urwid_loop.screen.set_terminal_properties(colors=256)
+
+    async def update_connection_state_loop(self):
+        while True:
+            connection_state = await connection_state_queue.get()
+
+            # self.main_frame.header = urwid.AttrMap(
+            #    urwid.Text(f"pbcon - Connection: {connection_state}"),
+            #    'success' if connection_state == ConnectionStates.CONNECTED else 'warn')
+
+            self.connection_state.original_widget.set_text(
+                f"pbcon - Connection: {connection_state}")
+            self.connection_state.set_attr_map(
+                {None: 'success' if connection_state == ConnectionStates.CONNECTED else 'warn'})
+
+            self.urwid_loop.draw_screen()
+
+    async def update_compile_loop(self):
+
+        async def update_timestamp(timestamp, utext):
+            while timestamp == compile_timestamp:
+                human_delta = humanize.naturaldelta(
+                    datetime.datetime.now() - datetime.datetime.fromtimestamp(timestamp))
+                human_size = humanize.naturalsize(len(mpy)) if mpy else "0"
+                utext.set_text(f"Compilation: {human_size}, {human_delta} ago")
+                self.urwid_loop.draw_screen()
+                await asyncio.sleep(1)
+
+        while True:
+            update = await compile_update_queue.get()
+            logger.info(f"Compile update: {update}")
+            timestamp = update['last_compiled']
+            module_list = [urwid.AttrMap(urwid.Text(m), 'success')
+                           for m in update['modules']]
+            if update['modules_missing']:
+                for m in update['modules_missing']:
+                    module_list.append(urwid.AttrMap(urwid.Text(m), 'warn'))
+            main_text = urwid.Text("")
+            self.main_frame.footer = urwid.AttrMap(urwid.Columns(
+                [main_text, urwid.Columns(module_list)]), 'success' if not update['modules_missing'] else 'warn')
+            self.urwid_loop.draw_screen()
+            self.asyncio_event_loop.create_task(
+                update_timestamp(timestamp, main_text))
+            await asyncio.sleep(0.1)
+
+    async def update_upload_progress_loop(self):
+
+        last_upload_id = None
+
+        def set_attr(attribute):
+            self.upload_state.set_attr_map({None: attribute})
+
+        def set_text(str):
+            self.upload_state.original_widget.set_text(str)
+
+        async def update_timestamp_fn(my_upload_id, text_widget):
+            while last_upload_id == my_upload_id:
+                human_delta = humanize.naturaldelta(
+                    datetime.datetime.now() - datetime.datetime.fromtimestamp(upload_timestamp))
+                text_widget.set_text(f"Uploaded: {human_delta} ago")
+                set_attr('success' if upload_timestamp >
+                         compile_timestamp else 'warn')
+                self.urwid_loop.draw_screen()
+                await asyncio.sleep(1)
+
+        while True:
+            type, value = await upload_state_queue.get()
+            if type == "start":
+                set_attr('warn')
+                last_upload_id = time.time()
+                self.urwid_loop.draw_screen()
+            if type == "progress":
+                set_text(f"Uploading: {value * 100:.0f}%")
+                set_attr('warn')
+                self.urwid_loop.draw_screen()
+            elif type == "success":
+                self.upload_state.original_widget.set_text(
+                    f"Uploaded")
+                self.urwid_loop.draw_screen()
+                last_upload_id = time.time()
+                self.asyncio_event_loop.create_task(
+                    update_timestamp_fn(last_upload_id, self.upload_state.original_widget))
+            elif type == "error":
+                self.upload_state.original_widget.set_text(
+                    f"Upload Error: {value}")
+                self.urwid_loop.draw_screen()
+
+
+async def main_loop():
+    while True:
+        await asyncio.sleep(1)
+
+
+async def connection_loop():
+    sevvice_uuid = f"c5f5{opts.id:04x}-8280-46da-89f4-6d8051e4aeef"
+    while True:
+        try:
+            logger.info(f"Searching for {opts.hub_name}")
+            connection_state_queue.put_nowait(ConnectionStates.SEARCHING)
+            devive_or_address = await find_device(name=opts.hub_name,
+                                                  service=sevvice_uuid,
+                                                  timeout=60)
+            logger.info(f"Connecting to {devive_or_address}")
+            connection_state_queue.put_nowait(ConnectionStates.CONNECTING)
+            await hub.connect(devive_or_address)
+            logger.info(f"Connected to {devive_or_address}")
+            connection_state_queue.put_nowait(ConnectionStates.CONNECTED)
+            while hub.connection_state_observable.value == ConnectionState.CONNECTED:
+                await asyncio.sleep(0.1)
+            logger.warning("Lost connection")
+            connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            await asyncio.sleep(0.1)
+
+
+async def compile_loop():
+    global compile_timestamp
+    modules_missing = []
+    modules = []
+
+    def update_modules(file_path: str):
+        global compile_timestamp
+        nonlocal modules_missing, modules
+        previous_modules = modules
+        previous_modules_missing = modules_missing
+        modules_missing = []
+        modules = []
+        from modulefinder import ModuleFinder
+        import time
+        search_path = [os.path.dirname(file_path)]
+        mf = ModuleFinder(search_path)
+        try:
+            mf.run_script(file_path)
+        except Exception as e:
+            logger.error(f"Module Error: {e}")
+            modules_missing.append(file_path)
+        for name, module in mf.modules.items():
+            if module.__file__ is None:
+                modules_missing.append(name)
+            else:
+                modules.append(os.path.relpath(module.__file__))
+        for name in mf.any_missing():
+            if name.startswith("pybricks"):
+                continue
+            if name in ["ujson", "umath"]:
+                continue
+            modules_missing.append(name)
+        if previous_modules != modules or previous_modules_missing != modules_missing:
+            logger.info(f"Modules changed: {modules_missing} {modules}")
+            compile_timestamp = 0
+
+    async def compile(file_path: str):
+        global mpy
+        try:
+            mpy = await compile_multi_file(file_path, (6, 1))
+            logger.info(f"Compiled {opts.file.name}")
+        except Exception as e:
+            logger.error(f"Compilation Error: {e}")
+
+    while True:
+        await asyncio.sleep(1)
+        update_modules(opts.file.name)
+        # logger.info(f"Checking {modules}")
+        try:
+            last_modified = max([os.path.getmtime(p) for p in modules])
+        except Exception as e:
+            last_modified = os.path.getmtime(opts.file.name)
+        if compile_timestamp < last_modified:
+            logger.info(f"Compiling {opts.file.name}")
+            compile_timestamp = int(time.time())
+            await compile(opts.file.name)
+            compile_update_queue.put_nowait({'last_compiled': compile_timestamp,
+                                             'main': opts.file.name,
+                                             'modules': modules,
+                                             'modules_missing': modules_missing})
+
+
+async def run():
+    # TODO clean buffer and stuff,
+    # see https://github.com/pybricks/pybricksdev/blob/11667cb05427b2638fb475c1561fdfa380f59998/pybricksdev/connections/pybricks.py#L531-L537
+    # we might have to extend the hub class to do this
+    # or this maybe can be used: https://github.com/pybricks/pybricksdev/blob/11667cb05427b2638fb475c1561fdfa380f59998/pybricksdev/connections/pybricks.py#L412
+    logger.info("Running")
+    try:
+        if upload_timestamp <= compile_timestamp:
+            await hub.upload(mpy)
+        await hub.stop_user_program()
+        await hub.start_user_program()
+        await hub._wait_for_user_program_stop()
+    except Exception as e:
+        logger.error(e)
+    finally:
+        logger.info("Stopped")
+
+
+async def upload_loop():
+    global upload_timestamp
+
+    while True:
+        timestamp = await upload_queue.get()
+        if timestamp > upload_timestamp:
+            await hub.upload()
 
 
 def parse_args():
-    import argparse
+
     parser = argparse.ArgumentParser(
         description="Connects to a Pybricks device, upload and runs a program.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -82,181 +488,23 @@ def parse_args():
     parser.add_argument('hub_name', help='Name of the hub')
     parser.add_argument('file', type=argparse.FileType(),
                         help='Path to the file')
-    parser.add_argument('--connection_timeout', type=int, default=60,
-                        help='Timeout in seconds for the connection')
     return parser.parse_args()
 
 
-def module_finder(file_path):
-    from modulefinder import ModuleFinder
-    search_path = [os.path.dirname(file_path)]
-    finder = ModuleFinder(search_path)
-    finder.run_script(file_path)
-    return finder
-
-
-async def compile(file_path):
-    global mpy
-    logger.info(f"Compiling {file_path}")
-    for name in module_finder(file_path).any_missing():
-        if name.startswith("pybricks"):
-            continue
-        if name in ['ujson', 'umath']:
-            continue
-        logger.warning(f"Missing module: {name}")
-    mpy = await compile_multi_file(file_path, (6, 1))
-    # pybricksdev.compile.print_mpy(mpy)
-    logger.info(f"Compiled {file_path}, size: {len(mpy)} bytes")
-
-
-async def upload():
-    await hub.upload()
-
-
-async def hub_output_logger_loop():
-    current_log_file = None
-    first_line = True
-
-    def close_current_log_file():
-        nonlocal current_log_file
-        try:
-            if current_log_file:
-                current_log_file.write("]")
-                current_log_file.close()
-                current_log_file = None
-        except Exception as e:
-            logger.error(e)
-
-    def start_new_log_file():
-        nonlocal current_log_file, first_line
-        close_current_log_file()
-        first_line = True
-        ts = datetime.datetime.now().replace(microsecond=0).isoformat()
-        log_file_path = os.path.join(
-            opts.data_log_dir, f"{opts.data_log_prefix}{ts}.json")
-        current_log_file = open(log_file_path, "w")
-        symlink_path = os.path.join(
-            opts.data_log_dir, f"{opts.data_log_prefix}latest.json")
-        Path(symlink_path).unlink(missing_ok=True)
-        os.symlink(os.path.basename(log_file_path), symlink_path)
-
-    while is_running:
-        line = await hub.read_line()
-        try:
-            data = json.loads(line)
-            logger.debug("DATA: " + json.dumps(data))
-            if not type(data) is dict:
-                logger.info("HUB OUTPUT: " + line)
-            elif data["type"] == 'data-log-start':
-                start_new_log_file()
-            elif data["type"] == 'data-log':
-                if current_log_file:
-                    if first_line:
-                        current_log_file.write("[")
-                        first_line = False
-                    else:
-                        current_log_file.write('\n,')
-                    current_log_file.write(json.dumps(data))
-            elif data["type"] == 'data-log-end':
-                close_current_log_file()
-            else:
-                logger.info("HUB DATA OUTPUT: " + json.dumps(data))
-        except json.JSONDecodeError as ex:
-            logger.info("HUB OUTPUT: " + line)
-            continue
-
-    close_current_log_file()
-
-
-async def run():
-    # TODO clean buffer and stuff,
-    # see https://github.com/pybricks/pybricksdev/blob/11667cb05427b2638fb475c1561fdfa380f59998/pybricksdev/connections/pybricks.py#L531-L537
-    # we might have to extend the hub class to do this
-    # or this maybe can be used: https://github.com/pybricks/pybricksdev/blob/11667cb05427b2638fb475c1561fdfa380f59998/pybricksdev/connections/pybricks.py#L412
-    logger.info("Running")
-    try:
-        await hub.start_user_program()
-        await hub._wait_for_user_program_stop()
-    except Exception as e:
-        logger.error(e)
-    finally:
-        logger.info("Stopped")
-
-
-async def connect():
-    sevvice_uuid = f"c5f5{opts.id:04x}-8280-46da-89f4-6d8051e4aeef"
-    hub = Hub()
-    logger.info(f"Searching for {opts.hub_name}")
-    devive_or_address = await find_device(name=opts.hub_name,
-                                          service=sevvice_uuid,
-                                          timeout=opts.connection_timeout)
-    logger.info(f"Connecting to {devive_or_address}")
-    await hub.connect(devive_or_address)
-    logger.info(f"Connected to {devive_or_address}")
-    return hub
-
-
-async def disconnect():
-    global hub
-    await hub.disconnect()
-
-
-async def mainloop():
-    global is_running
-    while is_running:
-        cmd = input("Enter command: ")
-        if cmd in ['q', 'quit', 'exit']:
-            logger.info("Quitting")
-            is_running = False
-            break
-        elif cmd in ['u', 'upload']:
-            try:
-                await compile(opts.file.name)
-                await upload()
-            except Exception as e:
-                logger.error(e)
-        elif cmd in ['r', 'run']:
-            await run()
-        else:
-            logger.info("Invalid command")
-        await asyncio.sleep(0.1)
-
-
-async def main_run():
-    global logger, hub, is_running, opts
-    opts = parse_args()
-    print(opts)
-    logger = init_logger()
-    logger.debug("Debug mode enabled")
-
-    try:
-        await compile(opts.file.name)
-    except Exception as e:
-        logger.error(e)
-
-    hub = await connect()
-
-    is_running = True
-
-    event_loop.create_task(hub_output_logger_loop())
-    event_loop.create_task(mainloop())
-
-    while is_running:
-        await asyncio.sleep(1)
-
-    await disconnect()
-
-
 def main():
-    global event_loop, is_running
-    try:
-        event_loop.run_until_complete(main_run())
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt")
-        is_running = False
-        event_loop.run_until_complete(disconnect())
-    finally:
-        event_loop.close()
+    global hub, logger, opts, ui
+    opts = parse_args()
+    logger = init_app_logger()
+    hub = Hub()
+    ui = UI(hub)
+    ui.asyncio_event_loop.create_task(main_loop())
+    ui.asyncio_event_loop.create_task(ui.update_connection_state_loop())
+    ui.asyncio_event_loop.create_task(ui.update_compile_loop())
+    ui.asyncio_event_loop.create_task(ui.update_upload_progress_loop())
+    ui.asyncio_event_loop.create_task(connection_loop())
+    ui.asyncio_event_loop.create_task(compile_loop())
+    ui.asyncio_event_loop.create_task(upload_loop())
+    ui.urwid_loop.run()
 
 
 if __name__ == "__main__":

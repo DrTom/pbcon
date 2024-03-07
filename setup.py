@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 import sys
 import os
 
-version = '1.0.3'
+version = '1.1.0'
 
 setup(name='pbcon',
       version=version,
@@ -19,12 +19,15 @@ setup(name='pbcon',
       include_package_data=True,
       zip_safe=False,
       install_requires=[
-          'pybricksdev',  # Add pybricksdev as a requirement
+          'humanize>=4.9.0',
+          'pybricks>=3.0.0',
+          'pybricksdev>=1.0.0a46',
+          'urwid>=2.5.3',
       ],
       entry_points={
           'console_scripts': [
               'pbscan = pbcon.pbscan:main',
-              'pbcon = pbcon.pbcon:main',  # Add pbcon as a console script
+              'pbcon = pbcon.pbcon:main',
           ],
       },
       )
