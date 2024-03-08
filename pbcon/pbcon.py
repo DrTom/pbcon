@@ -8,6 +8,7 @@ import datetime
 import humanize
 import io
 import logging
+import logging.handlers
 import os
 import urwid
 
@@ -55,6 +56,7 @@ def init_app_logger():
     formatter = logging.Formatter(
         fmt='%(asctime)s.%(msecs)03d %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S')
+    os.makedirs("logs", exist_ok=True)
     file_handler = logging.handlers.RotatingFileHandler(
         "logs/pbcon.log", maxBytes=1024**5, backupCount=5)
     file_handler.setLevel(logging.DEBUG)
@@ -168,6 +170,21 @@ class Hub(PybricksHub):
             logger.error(f"Upload Error: {e}")
             upload_state_queue.put_nowait(["error", e])
 
+    async def stop(self):
+        await self.stop_user_program()
+
+    async def run(self):
+        logger.info("Running")
+        try:
+            if upload_timestamp <= compile_timestamp:
+                await self.upload(mpy)
+            await self.stop()
+            await self.start_user_program()
+            await self._wait_for_user_program_stop()
+        except Exception as e:
+            logger.error(e)
+        finally:
+            logger.info("Stopped")
 
 class UI:
 
@@ -230,7 +247,11 @@ class UI:
                 self.main_frame.body = UI.HubLog.listbox
                 self.urwid_loop.draw_screen()
             elif key in ('r', 'R'):
-                self.asyncio_event_loop.create_task(run())
+                self.asyncio_event_loop.create_task(hub.run())
+                self.main_frame.body = UI.HubLog.listbox
+                self.urwid_loop.draw_screen()
+            elif key in ('s', 'S'):
+                self.asyncio_event_loop.create_task(hub.stop())
             elif key in ('u', 'U'):
                 upload_queue.put_nowait(time.time())
             else:
@@ -245,11 +266,13 @@ class UI:
             urwid.Text(""),
             urwid.Text("q: quit"),
             urwid.Text(""),
-            urwid.Text("l: show pbcon application log"),
+            urwid.Text("l: show the hub log"),
+            urwid.Text(""),
+            urwid.Text("r: run the program (upload it first if upload is outdated)"),
+            urwid.Text(""),
+            urwid.Text("s: stop the running program"),
             urwid.Text(""),
             urwid.Text("u: upload program"),
-            urwid.Text(""),
-            urwid.Text("r: run program"),
         ]))
 
         self.connection_state = urwid.AttrMap(urwid.Text(""), 'warn')
@@ -443,24 +466,6 @@ async def compile_loop():
                                              'main': opts.file.name,
                                              'modules': modules,
                                              'modules_missing': modules_missing})
-
-
-async def run():
-    # TODO clean buffer and stuff,
-    # see https://github.com/pybricks/pybricksdev/blob/11667cb05427b2638fb475c1561fdfa380f59998/pybricksdev/connections/pybricks.py#L531-L537
-    # we might have to extend the hub class to do this
-    # or this maybe can be used: https://github.com/pybricks/pybricksdev/blob/11667cb05427b2638fb475c1561fdfa380f59998/pybricksdev/connections/pybricks.py#L412
-    logger.info("Running")
-    try:
-        if upload_timestamp <= compile_timestamp:
-            await hub.upload(mpy)
-        await hub.stop_user_program()
-        await hub.start_user_program()
-        await hub._wait_for_user_program_stop()
-    except Exception as e:
-        logger.error(e)
-    finally:
-        logger.info("Stopped")
 
 
 async def upload_loop():
