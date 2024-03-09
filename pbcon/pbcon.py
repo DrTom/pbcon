@@ -31,9 +31,6 @@ class ConnectionStates:
     DISCONNECTING = "DISCONNECTING"
 
 
-connection_state_queue: asyncio.Queue = asyncio.Queue()
-connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
-
 hub: Hub = None
 
 logger: logging.Logger = None
@@ -56,7 +53,7 @@ def init_app_logger():
     formatter = logging.Formatter(
         fmt='%(asctime)s.%(msecs)03d %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S')
-    os.makedirs("logs", exist_ok=True)
+    os.makedirs(opts.log_dir, exist_ok=True)
     file_handler = logging.handlers.RotatingFileHandler(
         "logs/pbcon.log", maxBytes=1024**5, backupCount=5)
     file_handler.setLevel(logging.DEBUG)
@@ -186,6 +183,7 @@ class Hub(PybricksHub):
         finally:
             logger.info("Stopped")
 
+
 class UI:
 
     class HubLog:
@@ -193,18 +191,16 @@ class UI:
         listbox: urwid.ListBox = urwid.ListBox(urwid.SimpleListWalker([]))
         hub: Hub = None
 
-    def __init_hub_log(self, hub: Hub):
+    def __init_hub_log(self):
 
-        UI.HubLog.hub = hub
-
-        UI.HubLog.listbox.body.append(urwid.Text("Hub Log:"))
+        UI.HubLog.hub = self.hub
 
         queue_handler = logging.handlers.QueueHandler(UI.HubLog.queue)
         queue_handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter(
             fmt='%(asctime)s %(message)s',
             datefmt='%H:%M:%S')
-        hub.hub_stdout_logger.addHandler(queue_handler)
+        self.hub.hub_stdout_logger.addHandler(queue_handler)
 
         async def hub_log_loop(self):
             listbox = UI.HubLog.listbox
@@ -221,7 +217,58 @@ class UI:
 
         asyncio.get_event_loop().create_task(hub_log_loop(self))
 
+
+    def __init_connection_manager(self):
+
+        connection_state_queue: asyncio.Queue = asyncio.Queue()
+        connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
+
+        async def connection_loop(self):
+            sevvice_uuid = f"c5f5{opts.id:04x}-8280-46da-89f4-6d8051e4aeef"
+            while True:
+                try:
+                    logger.info(f"Searching for {opts.hub_name}")
+                    connection_state_queue.put_nowait(ConnectionStates.SEARCHING)
+                    devive_or_address = await find_device(name=opts.hub_name,
+                                                        service=sevvice_uuid,
+                                                        timeout=opts.timeout)
+                    logger.info(f"Connecting to {devive_or_address}")
+                    connection_state_queue.put_nowait(ConnectionStates.CONNECTING)
+                    await hub.connect(devive_or_address)
+                    logger.info(f"Connected to {devive_or_address}")
+                    connection_state_queue.put_nowait(ConnectionStates.CONNECTED)
+                    while hub.connection_state_observable.value == ConnectionState.CONNECTED:
+                        await asyncio.sleep(0.1)
+                    logger.warning("Lost connection, reconnecting")
+                    connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
+                except Exception as e:
+                    logger.error(f"Error: {e}")
+                    raise e
+
+        async def update_connection_state_loop(self):
+            while True:
+                connection_state = await connection_state_queue.get()
+
+                # self.main_frame.header = urwid.AttrMap(
+                #    urwid.Text(f"pbcon - Connection: {connection_state}"),
+                #    'success' if connection_state == ConnectionStates.CONNECTED else 'warn')
+
+                self.connection_state.original_widget.set_text(
+                    f"pbcon - Connection: {connection_state}")
+                self.connection_state.set_attr_map(
+                    {None: 'success' if connection_state == ConnectionStates.CONNECTED else 'warn'})
+
+                self.urwid_loop.draw_screen()
+
+
+        self.asyncio_event_loop.create_task(connection_loop(self))
+        self.asyncio_event_loop.create_task(update_connection_state_loop(self))
+
+
     def __init__(self, hub: Hub):
+        self.hub = hub
+
+
         self.palette = [
             ("body", "black", "light gray", "standout"),
             ("reverse", "light gray", "black"),
@@ -257,7 +304,8 @@ class UI:
             else:
                 return key
 
-        self.__init_hub_log(hub)
+        self.asyncio_event_loop = asyncio.get_event_loop()
+        evl = urwid.AsyncioEventLoop(loop=self.asyncio_event_loop)
 
         self.help = urwid.ListBox(urwid.SimpleListWalker([
             urwid.Text("pbcon - Pybricks Controller"),
@@ -283,29 +331,18 @@ class UI:
             header=urwid.Columns([self.connection_state, self.upload_state]),
             body=self.help)
 
-        self.asyncio_event_loop = asyncio.get_event_loop()
-        evl = urwid.AsyncioEventLoop(loop=self.asyncio_event_loop)
+        self.__init_hub_log()
+
+        self.__init_connection_manager()
+
         self.urwid_loop = urwid.MainLoop(
             widget=self.main_frame,
             palette=self.palette,
             event_loop=evl,
             unhandled_input=handle_keys)
+
         # self.urwid_loop.screen.set_terminal_properties(colors=256)
 
-    async def update_connection_state_loop(self):
-        while True:
-            connection_state = await connection_state_queue.get()
-
-            # self.main_frame.header = urwid.AttrMap(
-            #    urwid.Text(f"pbcon - Connection: {connection_state}"),
-            #    'success' if connection_state == ConnectionStates.CONNECTED else 'warn')
-
-            self.connection_state.original_widget.set_text(
-                f"pbcon - Connection: {connection_state}")
-            self.connection_state.set_attr_map(
-                {None: 'success' if connection_state == ConnectionStates.CONNECTED else 'warn'})
-
-            self.urwid_loop.draw_screen()
 
     async def update_compile_loop(self):
 
@@ -383,29 +420,6 @@ async def main_loop():
         await asyncio.sleep(1)
 
 
-async def connection_loop():
-    sevvice_uuid = f"c5f5{opts.id:04x}-8280-46da-89f4-6d8051e4aeef"
-    while True:
-        try:
-            logger.info(f"Searching for {opts.hub_name}")
-            connection_state_queue.put_nowait(ConnectionStates.SEARCHING)
-            devive_or_address = await find_device(name=opts.hub_name,
-                                                  service=sevvice_uuid,
-                                                  timeout=60)
-            logger.info(f"Connecting to {devive_or_address}")
-            connection_state_queue.put_nowait(ConnectionStates.CONNECTING)
-            await hub.connect(devive_or_address)
-            logger.info(f"Connected to {devive_or_address}")
-            connection_state_queue.put_nowait(ConnectionStates.CONNECTED)
-            while hub.connection_state_observable.value == ConnectionState.CONNECTED:
-                await asyncio.sleep(0.1)
-            logger.warning("Lost connection")
-            connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            await asyncio.sleep(0.1)
-
-
 async def compile_loop():
     global compile_timestamp
     modules_missing = []
@@ -478,14 +492,14 @@ async def upload_loop():
 
 
 def parse_args():
-
+    
     parser = argparse.ArgumentParser(
         description="Connects to a Pybricks device, upload and runs a program.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="Timeout in seconds for the connection.")
     parser.add_argument(
-        '--data-log-dir', help="relative path to log dir", type=str, default='logs')
-    parser.add_argument('--data-log-prefix',
-                        help="prefix for data log files", default='run-data_')
+        '--log-dir', help="relative path to the log dir", type=str, default='logs')
     parser.add_argument('-d', '--debug', action='store_true')
     parser.add_argument(
         "--id", type=int, default=1,
@@ -503,10 +517,8 @@ def main():
     hub = Hub()
     ui = UI(hub)
     ui.asyncio_event_loop.create_task(main_loop())
-    ui.asyncio_event_loop.create_task(ui.update_connection_state_loop())
     ui.asyncio_event_loop.create_task(ui.update_compile_loop())
     ui.asyncio_event_loop.create_task(ui.update_upload_progress_loop())
-    ui.asyncio_event_loop.create_task(connection_loop())
     ui.asyncio_event_loop.create_task(compile_loop())
     ui.asyncio_event_loop.create_task(upload_loop())
     ui.urwid_loop.run()
