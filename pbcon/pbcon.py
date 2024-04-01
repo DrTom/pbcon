@@ -185,17 +185,109 @@ class Hub(PybricksHub):
 
 
 class UI:
+    PALETTE = [
+        ("body", "black", "light gray", "standout"),
+        ("bright", "dark gray", "light gray", ("bold", "standout")),
+        ("button", "yellow", "black"),
+        ("buttonf", "white", "black", "bold"),
+        ("repl-edit", "black", "light gray"),
+        ("repl-edit-f", "white", "light gray"),
+        ("header", "white", "dark blue", "bold"),
+        ("important", "dark blue", "light gray", ("standout", "underline")),
+        ("reverse", "light gray", "black"),
+        ("success", "light gray", "dark green", "standout"),
+        ("warn", "light gray", "dark red", ("bold", "standout")),
+    ]
 
-    class HubLog:
+    class UiHub:
+
         queue: asyncio.Queue = asyncio.Queue()
-        listbox: urwid.ListBox = urwid.ListBox(urwid.SimpleListWalker([]))
+
+        log_listbox: urwid.ListBox = urwid.ListBox(urwid.SimpleListWalker([]))
+
         hub: Hub = None
+
+        class ReplEditor:
+
+            def __init__(self, hub) -> None:
+                self.hub = hub
+
+                self.history = ["# history start",]
+
+                self.history_index = 1
+
+                self.repl_editor: urwid.Edit = urwid.Edit(
+                    multiline=True, wrap='clip')
+
+                def recall_prev(button):
+                    if self.history_index > 0:
+                        self.history_index = self.history_index - 1
+                    self.repl_editor.set_edit_text(
+                        self.history[self.history_index])
+
+                self.button_prev:  urwid.Button = urwid.Button(
+                    "Recall Prev", on_press=recall_prev)
+
+                def recall_next(button):
+                    if self.history_index < len(self.history) - 1:
+                        self.history_index = self.history_index + 1
+                    self.repl_editor.set_edit_text(
+                        self.history[self.history_index])
+
+                self.button_next:  urwid.Button = urwid.Button(
+                    "Recall Next", on_press=recall_next)
+
+                def clear(button):
+                    self.repl_editor.set_edit_text("")
+                    self.history_index = 0
+
+                self.button_clear: urwid.Button = urwid.Button(
+                    "Clear", on_press=clear)
+
+                def py_format(button):
+                    import autopep8
+                    try:
+                        formatted = autopep8.fix_code(
+                            self.repl_editor.get_edit_text())
+                        self.repl_editor.set_edit_text(formatted)
+                    except Exception as e:
+                        logger.error(f"Error: {e}")
+
+                self.button_py_format: urwid.Button = urwid.Button(
+                    "PyFormat", on_press=py_format)
+
+                def send_data(button):
+                    data = self.repl_editor.get_edit_text()
+                    self.history.append(data)
+                    self.history_index = len(self.history) - 1
+                    logger.debug("SEND: " + data)
+                    asyncio.get_event_loop().create_task(
+                        self.hub.write_line(data))
+
+                self.button_send: urwid.Button = urwid.Button(
+                    "Send", on_press=send_data)
+
+                self.repl_editor_frame: urwid.Frame = urwid.Frame(
+                    urwid.AttrMap(
+                        urwid.Filler(
+                            self.repl_editor, valign='top'),
+                        'repl-edit', 'repl-edit-f'),
+                    footer=urwid.AttrMap(urwid.Padding(
+                        urwid.GridFlow([urwid.AttrMap(btn, "button", "buttonf")
+                                        for btn in [
+                                            self.button_prev,
+                                            self.button_clear,
+                                            self.button_next,
+                                            self.button_py_format,
+                                            self.button_send]],
+                                       cell_width=15, h_sep=10, v_sep=1, align='center'),
+                        left=1, right=1), 'header'))
 
     def __init_hub_log(self):
 
-        UI.HubLog.hub = self.hub
+        UI.UiHub.hub = self.hub
 
-        queue_handler = logging.handlers.QueueHandler(UI.HubLog.queue)
+        queue_handler = logging.handlers.QueueHandler(UI.UiHub.queue)
         queue_handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter(
             fmt='%(asctime)s %(message)s',
@@ -203,9 +295,9 @@ class UI:
         self.hub.hub_stdout_logger.addHandler(queue_handler)
 
         async def hub_log_loop(self):
-            listbox = UI.HubLog.listbox
+            listbox = UI.UiHub.log_listbox
             while True:
-                log_record = await UI.HubLog.queue.get()
+                log_record = await UI.UiHub.queue.get()
                 listbox.body.append(
                     urwid.Text(formatter.format(log_record)))
                 if len(listbox.body) > 100:
@@ -217,7 +309,6 @@ class UI:
 
         asyncio.get_event_loop().create_task(hub_log_loop(self))
 
-
     def __init_connection_manager(self):
 
         connection_state_queue: asyncio.Queue = asyncio.Queue()
@@ -228,19 +319,23 @@ class UI:
             while True:
                 try:
                     logger.info(f"Searching for {opts.hub_name}")
-                    connection_state_queue.put_nowait(ConnectionStates.SEARCHING)
+                    connection_state_queue.put_nowait(
+                        ConnectionStates.SEARCHING)
                     devive_or_address = await find_device(name=opts.hub_name,
-                                                        service=sevvice_uuid,
-                                                        timeout=opts.timeout)
+                                                          service=sevvice_uuid,
+                                                          timeout=opts.timeout)
                     logger.info(f"Connecting to {devive_or_address}")
-                    connection_state_queue.put_nowait(ConnectionStates.CONNECTING)
+                    connection_state_queue.put_nowait(
+                        ConnectionStates.CONNECTING)
                     await hub.connect(devive_or_address)
                     logger.info(f"Connected to {devive_or_address}")
-                    connection_state_queue.put_nowait(ConnectionStates.CONNECTED)
+                    connection_state_queue.put_nowait(
+                        ConnectionStates.CONNECTED)
                     while hub.connection_state_observable.value == ConnectionState.CONNECTED:
                         await asyncio.sleep(0.1)
                     logger.warning("Lost connection, reconnecting")
-                    connection_state_queue.put_nowait(ConnectionStates.DISCONNECTED)
+                    connection_state_queue.put_nowait(
+                        ConnectionStates.DISCONNECTED)
                 except Exception as e:
                     logger.error(f"Error: {e}")
                     raise e
@@ -260,29 +355,21 @@ class UI:
 
                 self.urwid_loop.draw_screen()
 
-
         self.asyncio_event_loop.create_task(connection_loop(self))
         self.asyncio_event_loop.create_task(update_connection_state_loop(self))
-
 
     def __init__(self, hub: Hub):
         self.hub = hub
 
+        repl_editor = UI.UiHub.ReplEditor(self.hub)
 
-        self.palette = [
-            ("body", "black", "light gray", "standout"),
-            ("reverse", "light gray", "black"),
-            ("header", "white", "dark blue", "bold"),
-            ("success", "light gray", "dark green", "standout"),
-            ("warn", "light gray", "dark red", ("bold", "standout")),
-            ("important", "dark blue", "light gray", ("standout", "underline")),
-            ("editfc", "white", "dark blue", "bold"),
-            ("editbx", "light gray", "dark blue"),
-            ("editcp", "black", "light gray", "standout"),
-            ("bright", "dark gray", "light gray", ("bold", "standout")),
-            ("buttn", "black", "dark cyan"),
-            ("buttnf", "white", "dark blue", "bold"),
-        ]
+        self.palette = UI.PALETTE
+
+        def show_hub_window():
+            self.main_frame.body = urwid.Columns(
+                [UI.UiHub.log_listbox,
+                 repl_editor.repl_editor_frame])
+            self.urwid_loop.draw_screen()
 
         def handle_keys(key):
             if key in ('q', 'Q'):
@@ -291,17 +378,16 @@ class UI:
                 self.main_frame.body = self.help
                 self.urwid_loop.draw_screen()
             elif key in ('l', 'L'):
-                self.main_frame.body = UI.HubLog.listbox
-                self.urwid_loop.draw_screen()
+                show_hub_window()
             elif key in ('r', 'R'):
                 self.asyncio_event_loop.create_task(hub.run())
-                self.main_frame.body = UI.HubLog.listbox
-                self.urwid_loop.draw_screen()
+                show_hub_window()
             elif key in ('s', 'S'):
                 self.asyncio_event_loop.create_task(hub.stop())
             elif key in ('u', 'U'):
                 upload_queue.put_nowait(time.time())
             else:
+                logger.debug(f"Key: {key}")
                 return key
 
         self.asyncio_event_loop = asyncio.get_event_loop()
@@ -316,7 +402,8 @@ class UI:
             urwid.Text(""),
             urwid.Text("l: show the hub log"),
             urwid.Text(""),
-            urwid.Text("r: run the program (upload it first if upload is outdated)"),
+            urwid.Text(
+                "r: run the program (upload it first if upload is outdated)"),
             urwid.Text(""),
             urwid.Text("s: stop the running program"),
             urwid.Text(""),
@@ -342,7 +429,6 @@ class UI:
             unhandled_input=handle_keys)
 
         # self.urwid_loop.screen.set_terminal_properties(colors=256)
-
 
     async def update_compile_loop(self):
 
@@ -449,7 +535,7 @@ async def compile_loop():
         for name in mf.any_missing():
             if name.startswith("pybricks"):
                 continue
-            if name in ["ujson", "umath"]:
+            if name in ["ujson", "umath", "uselect", "usys"]:
                 continue
             modules_missing.append(name)
         if previous_modules != modules or previous_modules_missing != modules_missing:
@@ -492,7 +578,7 @@ async def upload_loop():
 
 
 def parse_args():
-    
+
     parser = argparse.ArgumentParser(
         description="Connects to a Pybricks device, upload and runs a program.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)

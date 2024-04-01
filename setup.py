@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 import sys
 import os
 
-version = '1.2.1'
+version = '1.3.0'
 
 setup(name='pbcon',
       version=version,
@@ -19,6 +19,7 @@ setup(name='pbcon',
       include_package_data=True,
       zip_safe=False,
       install_requires=[
+          'autopep8==2.1.0',
           'humanize>=4.9.0',
           'pybricks>=3.0.0',
           'pybricksdev>=1.0.0a46',
