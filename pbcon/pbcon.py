@@ -548,6 +548,14 @@ async def compile_loop():
             mpy = await compile_multi_file(file_path, (6, 1))
             logger.info(f"Compiled {opts.file.name}")
         except Exception as e:
+            # there are some erros that are not found by the modulefinder
+            # but detected only by the compiler, catch them here
+            try:
+                modules.remove(file_path)
+            except Exception:
+                pass
+            modules_missing.append(file_path)
+            mpy = None
             logger.error(f"Compilation Error: {e}")
 
     while True:

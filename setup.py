@@ -2,11 +2,11 @@ from setuptools import setup, find_packages
 import sys
 import os
 
-version = '1.3.0'
+version = '1.3.1'
 
 setup(name='pbcon',
       version=version,
-      description="Convenience tools to work with pybricks.",
+      description="Convenience tools to work with pybricksdev.",
       long_description="""\
 """,
       classifiers=[],  # Get strings from http://pypi.python.org/pypi?%3Aaction=list_classifiers
