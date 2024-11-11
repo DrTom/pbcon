@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 import sys
 import os
 
-version = '1.3.1'
+version = '1.3.2'
 
 setup(name='pbcon',
       version=version,

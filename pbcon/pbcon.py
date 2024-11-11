@@ -437,7 +437,8 @@ class UI:
                 human_delta = humanize.naturaldelta(
                     datetime.datetime.now() - datetime.datetime.fromtimestamp(timestamp))
                 human_size = humanize.naturalsize(len(mpy)) if mpy else "0"
-                utext.set_text(f"Compilation: {human_size}, {human_delta} ago")
+                utext.set_text(
+                    f"{opts.file.name} {human_size}, {human_delta} ago")
                 self.urwid_loop.draw_screen()
                 await asyncio.sleep(1)
 
@@ -445,8 +446,7 @@ class UI:
             update = await compile_update_queue.get()
             logger.info(f"Compile update: {update}")
             timestamp = update['last_compiled']
-            module_list = [urwid.AttrMap(urwid.Text(m), 'success')
-                           for m in update['modules']]
+            module_list = []
             if update['modules_missing']:
                 for m in update['modules_missing']:
                     module_list.append(urwid.AttrMap(urwid.Text(m), 'warn'))
