@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import Optional, List
 from pybricksdev.ble import find_device
 from pybricksdev.ble.pybricks import HubCapabilityFlag
+from bleak.backends.device import BLEDevice
 from pybricksdev.cli import _get_script_path
 from pybricksdev.compile import compile_multi_file
 from pybricksdev.connections import ConnectionState
-from pybricksdev.connections.pybricks import PybricksHub
+from pybricksdev.connections.pybricks import PybricksHubBLE
 import time
 
 
@@ -32,6 +33,10 @@ class ConnectionStates:
 
 
 hub: Hub = None
+
+service_uuid: str = None
+ble_device: BLEDevice = None
+
 
 logger: logging.Logger = None
 
@@ -62,7 +67,7 @@ def init_app_logger():
     return logger
 
 
-class Hub(PybricksHub):
+class Hub(PybricksHubBLE):
 
     def __init__hub_logger(self):
         self.print_output = False
@@ -355,7 +360,7 @@ class UI:
 
                 self.urwid_loop.draw_screen()
 
-        self.asyncio_event_loop.create_task(connection_loop(self))
+        # self.asyncio_event_loop.create_task(connection_loop(self))
         self.asyncio_event_loop.create_task(update_connection_state_loop(self))
 
     def __init__(self, hub: Hub):
@@ -604,19 +609,25 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    global hub, logger, opts, ui
-    opts = parse_args()
-    logger = init_app_logger()
-    hub = Hub()
-    ui = UI(hub)
-    ui.asyncio_event_loop.create_task(main_loop())
-    ui.asyncio_event_loop.create_task(ui.update_compile_loop())
-    ui.asyncio_event_loop.create_task(ui.update_upload_progress_loop())
-    ui.asyncio_event_loop.create_task(compile_loop())
-    ui.asyncio_event_loop.create_task(upload_loop())
-    ui.urwid_loop.run()
+async def main():
+    global hub, logger, opts, ui, service_uuid, ble_device
+    try: 
+        opts = parse_args()
+        logger = init_app_logger()
+        sevvice_uuid = f"c5f5{opts.id:04x}-8280-46da-89f4-6d8051e4aeef"
+        ble_device = await find_device(name=opts.hub_name,
+                                    service=sevvice_uuid,
+                                    timeout=opts.timeout)
+        hub = Hub(ble_device)
+        ui = UI(hub)
+        ui.asyncio_event_loop.create_task(main_loop())
+        ui.asyncio_event_loop.create_task(ui.update_compile_loop())
+        ui.asyncio_event_loop.create_task(ui.update_upload_progress_loop())
+        ui.asyncio_event_loop.create_task(compile_loop())
+        ui.asyncio_event_loop.create_task(upload_loop())
+    except asyncio.TimeoutError:
+        logger.error("Timeout Error: Bluetooth Device not found")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

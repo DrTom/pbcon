@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 import sys
 import os
 
-version = '1.3.2'
+version = '1.4.0'
 
 setup(name='pbcon',
       version=version,
@@ -22,7 +22,7 @@ setup(name='pbcon',
           'autopep8==2.1.0',
           'humanize>=4.9.0',
           'pybricks>=3.0.0',
-          'pybricksdev>=1.0.0a46',
+          'pybricksdev==1.0.1',
           'urwid>=2.5.3',
       ],
       entry_points={
