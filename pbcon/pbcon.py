@@ -535,7 +535,7 @@ async def compile_loop():
         for name in mf.any_missing():
             if name.startswith("pybricks"):
                 continue
-            if name in ["ujson", "umath", "uselect", "usys"]:
+            if name in ["ujson", "umath", "uselect", "usys", "ustruct"]:
                 continue
             modules_missing.append(name)
         if previous_modules != modules or previous_modules_missing != modules_missing:
